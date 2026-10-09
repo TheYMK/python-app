@@ -1,0 +1,33 @@
+redis-ha:
+  enabled: false
+
+controller:
+  replicas: 1
+
+repoServer:
+  replicas: 1
+
+applicationSet:
+  replicas: 1
+
+global:
+  domain: argocd.test.com
+
+configs:
+  params:
+    server.insecure: "true"
+
+certificate:
+  enabled: true
+
+server:
+  replicas: 1
+  ingress:
+    enabled: true
+    controller: generic
+    ingressClassName: traefik
+    hostname: argocd.test.com
+    path: /
+    pathType: Prefix
+    annotations: {}
+    tls: false
