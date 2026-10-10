@@ -15,7 +15,7 @@ def details():
             'title': 'Hello Kaym Kassai',
             'time': ts,
             'hostname': hn,
-            'version': "v1.0.9"
+            'version': "v1.1.0"
         }
     )
 
