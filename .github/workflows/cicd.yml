@@ -8,11 +8,23 @@ on:
     paths:
       - 'src/**'
 
+permissions:
+  contents: write
+
+concurrency:
+  group: python-app-deploy
+  cancel-in-progress: false
+
 jobs:
+  # ============================================
+  # CI - Build and push Docker image
+  # ============================================
   ci:
     runs-on: ubuntu-latest
+
     outputs:
       image_tag: ${{ steps.meta.outputs.version }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,7 +44,7 @@ jobs:
         with:
           images: kaymkassai269/python-app
           tags: |
-            type=sha,format=short,prefix=
+            type=sha,format=short,prefix=,priority=300
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
@@ -42,49 +54,131 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-  
+
+      - name: Print image tag
+        run: |
+          echo "Docker image successfully pushed"
+          echo "Image tag: ${{ steps.meta.outputs.version }}"
+
+  # ============================================
+  # CD - Update Helm and deploy with Argo CD
+  # ============================================
   cd:
     needs: ci
     runs-on: self-hosted
 
     steps:
+      # Checkout repository on the self-hosted runner
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      # Update the actual Helm values file
       - name: Update Helm values.yaml
         shell: bash
         env:
           IMAGE_TAG: ${{ needs.ci.outputs.image_tag }}
         run: |
+          set -euo pipefail
+
+          VALUES_FILE="charts/python-app/values.yaml"
+
+          echo "Working directory: $(pwd)"
           echo "Updating image tag to: $IMAGE_TAG"
+
+          if [ -z "$IMAGE_TAG" ] || [ "$IMAGE_TAG" = "latest" ]; then
+            echo "ERROR: Invalid image tag: $IMAGE_TAG"
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "ERROR: Helm values file not found!"
+            echo "Available values.yaml files:"
+            find . -name values.yaml -type f
+            exit 1
+          fi
 
           sed -i -E \
             "s/^  tag: .*/  tag: \"$IMAGE_TAG\"/" \
-            charts/python-app/values.yaml
+            "$VALUES_FILE"
 
-          cat charts/python-app/values.yaml
+          echo "Updated image configuration:"
+          grep -A 3 '^image:' "$VALUES_FILE"
 
-      - name: Commit and push changes
+      # Commit and push new image tag
+      - name: Commit and push Helm changes
+        id: git_push
         shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add charts/python-app/values.yaml
 
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No Helm changes detected"
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           else
             git commit -m "ci: update python-app image tag [skip ci]"
+
             git pull --rebase origin main
             git push origin HEAD:main
+
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo "Helm values pushed successfully"
           fi
-      - name: Install Argocd
+
+      # Install Argo CD CLI
+      - name: Install Argo CD
         shell: bash
         run: |
-          VERSION=$(curl -L -s https://raw.githubusercontent.com/argoproj/argo-cd/stable/VERSION)
-          curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/download/v$VERSION/argocd-linux-amd64
-          sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+          set -euo pipefail
+
+          VERSION=$(curl -fsSL \
+            https://raw.githubusercontent.com/argoproj/argo-cd/stable/VERSION)
+
+          curl -fsSL -o argocd-linux-amd64 \
+            "https://github.com/argoproj/argo-cd/releases/download/v${VERSION}/argocd-linux-amd64"
+
+          sudo install -m 555 \
+            argocd-linux-amd64 /usr/local/bin/argocd
+
           rm argocd-linux-amd64
-      - name: Argocd app sync
+
+          argocd version --client
+
+      # Synchronize Argo CD application
+      - name: Argo CD app sync
         shell: bash
+        env:
+          ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
+          ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+          DEPLOY_REVISION: ${{ steps.git_push.outputs.commit_sha }}
         run: |
-          argocd login argocd-server.argocd --plaintext --insecure --grpc-web --username ${{ secrets.ARGOCD_USERNAME }} --password ${{ secrets.ARGOCD_PASSWORD }}
-          argocd app sync python-app
+          set -euo pipefail
+
+          argocd login argocd-server.argocd \
+            --plaintext \
+            --grpc-web \
+            --username "$ARGOCD_USERNAME" \
+            --password "$ARGOCD_PASSWORD"
+
+          echo "Refreshing Argo CD application..."
+          argocd app get python-app --hard-refresh
+
+          echo "Syncing python-app at revision: $DEPLOY_REVISION"
+
+          argocd app sync python-app \
+            --revision "$DEPLOY_REVISION" \
+            --timeout 300
+
+          argocd app wait python-app \
+            --health \
+            --timeout 300
+
+          echo "Deployment completed successfully!"
